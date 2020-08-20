@@ -7,3 +7,5 @@
 manpage.diff
 kfreebsd.patch
 removesyslogtarget.patch
+update-smart-drivedb.in-add-gpg-verification-support.patch
+update-smart-drivedb.8.in-add-gpg-verification-support.patch

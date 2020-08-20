@@ -1,3 +1,13 @@
+smartmontools (6.5+svn4324-1ubuntu0.1) bionic; urgency=medium
+
+  * Add GPG verification support to update-smart-drivedb (LP: #1874362)
+    - d/p/update-smart-drivedb{,.8}.in-add-gpg-verification-support.patch:
+      created.
+    - d/rules: do not remove update-smart-drivedb during installation
+    - d/control: add update-smart-drivedb dependencies as Suggests
+
+ -- Lucas Kanashiro <kanashiro@ubuntu.com>  Thu, 20 Aug 2020 11:17:35 -0300
+
 smartmontools (6.5+svn4324-1) unstable; urgency=low
 
   * [a86ec89] Imported Upstream version 6.5+svn43204 (Closes: #831504)

@@ -1,0 +1,556 @@
+From: Lucas Kanashiro <lucas.kanashiro@canonical.com>
+Date: Thu, 20 Aug 2020 11:07:38 -0300
+Subject: Backport update-smart-drivedb.in with GPG verification support
+
+In order to make it work on this old version I needed to make some
+changes on top of the upstream version:
+
+- Updated the GPG public key, now the key with ID DFD22559 was included.
+This is the key used to sign the drivedb.h backported to this release.
+- Set some variables with default values used in Focal since they are not
+configurable in this old release.
+
+Origin: upstream, https://github.com/smartmontools/smartmontools/blob/RELEASE_7_1/smartmontools/update-smart-drivedb.in
+Bug-Ubuntu: #1874362
+Last-Updated: 2020-08-20
+---
+ update-smart-drivedb.in | 406 +++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 318 insertions(+), 88 deletions(-)
+
+diff --git a/update-smart-drivedb.in b/update-smart-drivedb.in
+index 9843444..c677d9d 100644
+--- a/update-smart-drivedb.in
++++ b/update-smart-drivedb.in
+@@ -2,21 +2,20 @@
+ #
+ # smartmontools drive database update script
+ #
+-# Copyright (C) 2010-16 Christian Franke
++# Home page of code is: http://www.smartmontools.org
+ #
+-# This program is free software; you can redistribute it and/or modify
+-# it under the terms of the GNU General Public License as published by
+-# the Free Software Foundation; either version 2, or (at your option)
+-# any later version.
++# Copyright (C) 2010-19 Christian Franke
+ #
+-# You should have received a copy of the GNU General Public License
+-# (for example COPYING); If not, see <http://www.gnu.org/licenses/>.
++# SPDX-License-Identifier: GPL-2.0-or-later
+ #
+-# $Id: update-smart-drivedb.in 4224 2016-02-26 20:29:24Z chrfranke $
++# $Id$
+ #
+ 
+ set -e
+ 
++# Set the same value used in Focal
++export PATH="/usr/local/bin:/usr/bin:/bin"
++
+ # Set by config.status
+ PACKAGE="@PACKAGE@"
+ VERSION="@VERSION@"
+@@ -36,13 +35,24 @@ BRANCH="@DRIVEDB_BRANCH@"
+ # Default drivedb location
+ DRIVEDB="$drivedbdir/drivedb.h"
+ 
++# GnuPG used to verify signature (disabled if empty)
++# Set the same value used in Focal
++GPG="gpg"
++
+ # Smartctl used for syntax check
+ SMARTCTL="$sbindir/smartctl"
+ 
++# PATH information for help and error messages
++# Set the same value used in Focal
++pathinfo="'$PATH'"
++
+ myname=$0
+ 
+ usage()
+ {
++  # Set the same value used in Focal
++  pathinfo="
++                   $pathinfo"
+   cat <<EOF
+ smartmontools $VERSION drive database update script
+ 
+@@ -51,22 +61,25 @@ Usage: $myname [OPTIONS] [DESTFILE]
+   -s SMARTCTL     Use SMARTCTL for syntax check ('-s -' to disable)
+                   [default: $SMARTCTL]
+   -t TOOL         Use TOOL for download: $os_dltools
+-                  [default: first one found in PATH]
++                  [default: first one found in $pathinfo]
+   -u LOCATION     Use URL of LOCATION for download:
+-                    sf (Sourceforge code browser via HTTPS)
+-                    svn (SVN repository via HTTPS) [default]
+-                    svni (SVN repository via HTTP)
+-                    trac (Trac code browser via HTTPS)
++                    github (GitHub mirror of SVN repository)
++                    sf (Sourceforge code browser)
++                    svn (SVN repository) [default]
++                    svni (SVN repository via HTTP instead of HTTPS)
++                    trac (Trac code browser)
++  --trunk         Download from SVN trunk (may require '--no-verify')
+   --cacert FILE   Use CA certificates from FILE to verify the peer
+   --capath DIR    Use CA certificate files from DIR to verify the peer
+   --insecure      Don't abort download if certificate verification fails
++  --no-verify     Don't verify signature
++  --export-key    Print the OpenPGP/GPG public key block
+   --dryrun        Print download commands only
+   -v              Verbose output
+ 
+ Updates $DRIVEDB
+-or DESTFILE from smartmontools SVN repository.
+-Tries to download first from branch $BRANCH
+-and then from trunk.
++or DESTFILE from branches/$BRANCH of smartmontools
++SVN repository.
+ EOF
+   exit 1
+ }
+@@ -77,6 +90,14 @@ error()
+   exit 1
+ }
+ 
++err_notfound()
++{
++  case $1 in
++    */*) error "$1: not found $2" ;;
++    *)   error "$1: not found in $pathinfo $2" ;;
++  esac
++}
++
+ warning()
+ {
+   echo "$myname: (Warning) $*" >&2
+@@ -85,6 +106,10 @@ warning()
+ selecturl()
+ {
+   case $1 in
++    github)  # https://github.com/smartmontools/smartmontools/raw/origin/$BRANCH/smartmontools/drivedb.h
++             # https://github.com/smartmontools/smartmontools/raw/master/smartmontools/drivedb.h
++          # redirected to:
++          url='https://raw.githubusercontent.com/smartmontools/smartmontools/master/smartmontools/drivedb.h' ;;
+     sf)   url='https://sourceforge.net/p/smartmontools/code/HEAD/tree/trunk/smartmontools/drivedb.h?format=raw' ;;
+     svn)  url='https://svn.code.sf.net/p/smartmontools/code/trunk/smartmontools/drivedb.h' ;;
+     svni) url='http://svn.code.sf.net/p/smartmontools/code/trunk/smartmontools/drivedb.h' ;;
+@@ -149,7 +174,7 @@ vrun2()
+ # download URL FILE
+ download()
+ {
+-  local f u se rc
++  local f u rc
+   u=$1; f=$2
+   rc=0
+ 
+@@ -207,15 +232,198 @@ download()
+   return $rc
+ }
+ 
++# check_file FILE FIRST_CHAR MIN_SIZE MAX_SIZE
++check_file()
++{
++  local firstchar f maxsize minsize size
++  test -z "$dryrun" || return 0
++  f=$1; firstchar=$2; minsize=$3; maxsize=$4
++
++  # Check first chars
++  case `dd if="$f" bs=1 count=1 2>/dev/null` in
++    $firstchar) ;;
++    \<) echo "HTML error message"; return 1 ;;
++    *)   echo "unknown file contents"; return 1 ;;
++  esac
++
++  # Check file size
++  size=`wc -c < "$f"`
++  if test "$size" -lt $minsize; then
++    echo "too small file size $size bytes"
++    return 1
++  fi
++  if test "$size" -gt $maxsize; then
++    echo "too large file size $size bytes"
++    return 1
++  fi
++  return 0
++}
++
++# unexpand_svn_id < INFILE > OUTFILE
++unexpand_svn_id()
++{
++  sed 's,\$''Id'': drivedb\.h [0-9][0-9]* 2[-0-9]* [012][:0-9]*Z [a-z][a-z0-9]* \$,$''Id''$,'
++}
++
++# Smartmontools Signing Key (through 2024)
++# <smartmontools-database@listi.jpberlin.de>
++# Key ID DFD22559
++public_key="\
++-----BEGIN PGP PUBLIC KEY BLOCK-----
++
++mQENBFgOYoEBCAC93841SlFmpp6640hKUvZ8PbZR6OGnZnMXD6QRVzpibXGZXUDB
++f6unujun5Ql4ObAWt6QuRqz5Gk2gF8tcOfN6edR/uK5gyX2rlWVLoZKOV91a3aDI
++iIDh018tLWOpHg3VxgHL6f0iMcFogUYnD5zhC5Z2GVhFb/cVpj+ocZWcxQLQGPVv
++uZPUQWrvdpFEzcnxPMtJJDqXEChzhrdFTXGm69ERxULOro7yDmG1Y5xWmhdGnPPM
++cuCXVVlADz/Gh1w+ay7RqFnzPjqjQmHAuggns467TJEcS0yiX4LJnEoKLyPGen9L
++FH6z38xHCNt4Da05/OeRgXwVLH9M95lu8d6TABEBAAG0U1NtYXJ0bW9udG9vbHMg
++U2lnbmluZyBLZXkgKGV4dC4gdG8gMjAyNCkgPHNtYXJ0bW9udG9vbHMtZGF0YWJh
++c2VAbGlzdGkuanBiZXJsaW4uZGU+iQFBBBMBAgArAhsDBQkPZe4NBgsJCAcDAgYV
++CAIJCgsEFgIDAQIeAQIXgAUCXheK5gIZAQAKCRDzh2PO39IlWdUTCAC8v9Oa7umW
+++/tXBiEtElDW/U2rEOC3OHWSzPvqE4iGjWc5fbvrAKS7bfccZM8Aq0a1t2pSbIlB
++MvRrsNTGdQSPsOdhxPD8pEJW0uH9Z5VyPzoO9VIaoqi1irRdWnXCfhBJX9PLySAb
++9BPQZXXQypmACieRDv31E4hiB+vYet/SpVuRyfL57XU3jmwFREip9OiFOp+61X2+
++oIlgvNU60JZy2vXpTo6PNbDGetEycfH6Y8vfCXniihMkSfeOnNqWI/hycBDprFB5
++CB5ShIH71vhCOPnVGwtYY30wlJ1+Ybg2ZAIi6JN8E38Dpx382IzeT2LydnZydiC6
++PcLCr7mbsX3hiQEcBBMBAgAGBQJeF4sWAAoJEC/N7AvTrxqr7ZAH/jB4xFtBTo1x
++w8CGwslZCJ+/BeEZ5XpV+8zLdeRV2tXegUFjGZ9FI6UpzBeVyK2R1qGbcdSf2S45
++KutcM2gjKETW+ZwW76qHJD52mYihPPLXu2pRAG2WyH5GDnqNMj5iQ1inoPdZOTpi
++evBMTv1YHJML6SiF6t/HoKorl5ffvHBE/1onBfUzLwQ/ct14sZ2UXHzyxdHo73vm
++XWgcjQ1TQhCSdLqucQbwR78EyUa9tYxk/NWBqfc5YHt7t+KTVTLlp7Buk1wscLkj
++NTlxl+IjAxRwsWc6PWnyRdAgXxtt2q6llYgFahWM21OyJVLVjbMGVF+oBtFumqq3
++lQy6H6tp/1uJAhwEEwECAAYFAl4XiyMACgkQvwsznGS8qosSiw//QjbWDldB2gHf
++3Tfs+LaFdzkDbioWdnj96DiCynTSwZF8d5ISqwA+QTL/43Y0msU26WBMvIRBg2Xm
+++r4TMMfWF4a1Yjq6cisKEaUsbjV9ztzH/XB2ydo8HgnxZuVKQoIuh1sSrE7p6mpQ
++YUrV5eWRpqc79AI9ZzRBM5nhbBejqLVw2F8dyz6c3lfGM9IOenp+Y8N43SdNpBcp
++DuHnzbQIMtkyoX7tTKDDv5gnoRNCsdBsCduTyNWYOIEdhRiCfo5Ce7kufIoo4ZqV
++BM8dzwm1RrcYa0kMKPZAucJDRjwevEYDbOg7vmEYsuGPRbVmOFdx4uMx4gX8vF5+
++AG3rTSA805zkwD+WQXyYQohVZxNjeK7P/ukr6NCZx226gwAiw1ms7PYOo8snjK8e
++nRlMTLKiGiMIH7xJu55JliVlcEvn3G7WO0n4qQOJj3Msh+xflBSfZmzBDAzPgxwC
++m/RSmonGV0uZVJFDHCpqus35E6bzFF6yO3yXvpngAMTBrpX6Nzgea1SzlK2Iquls
++te1GYAx/IXaY7cVYo4iEv/m346SINzLGHpXZkbbcenSgljBfHLCz7vF33IotfEWh
++C7Kb4iKbEjERa+zzqR+vK+nDj6YG9Mvguj1EqnM47oDwgMaqWY6oPfefLCD8Tg51
++rlAAGFdcWb9g034vgtK8l+ooUtn63PKJAhwEEwECAAYFAl4XiywACgkQ6nSrJXIQ
++QsUuTRAAsSMmQ7jsvmljExwrmIu6Oyh+1J5D/GPBRYhSyip/bnxCscCBnpjEk8+7
++VG9JtGTCa0zVY14Y3Cl4obND25QN9LhiE/y8olnIgJ2adtmpi6+zFpdGWVYUpDgZ
++IMePUVKyZenTjezFwRlLsYsxbSb9wIR1iofP1l/dQF8DwhwFL9AGRmHTcWM1ZYoc
++fv80A5SAposnspnkKKcuC3q2+pMsUtbHT9t/+iusVXBDERh+FPlvtYh+Khze3c8z
++g4M9RsQLCanMp4jZhzgSakjeg9tCr33SIJIEKpn6MUftX9QC82S75UNwxXgC38EA
++s2t+BjPLUaXENSdOe3l+KKY5ozbmRpRmQIHw7jlT3+9C0RUHGTPQYCidsx8OdYA0
++4wDRWcjCQcXWxTaUoeaoMJcE1iv5IIf/X0MXYMlCPG8OKAlDE2Kkrx0A8agPp7JH
++0UAOaqpAA74kZnpuvJ6BqrX2hMbNbyVg1rWu1BQA3qESa41rKiWyEtjiLdQ/NtNu
++6BsPhDGvaQqGbu4t0GfJ1PhbFnHrVkLW8v1NzYZRpLXAFJGZdD6Ue/L6bHFOJ6SJ
++JwAHjH26nxSMuDV779AUrnOcmoXIkj6sdAwDZ5Z2ri7b2MgkrJzeapKd0SItnWUQ
++TMe7YUl8B+kUATj01YWMLtHsX9yciFP0iDagW14/rFJHtchOBcu0U1NtYXJ0bW9u
++dG9vbHMgU2lnbmluZyBLZXkgKHRocm91Z2ggMjAxOCkgPHNtYXJ0bW9udG9vbHMt
++ZGF0YWJhc2VAbGlzdGkuanBiZXJsaW4uZGU+iQEcBBMBAgAGBQJZ7kylAAoJEC/N
++7AvTrxqroQQH/jrZAGT5t8uyzRTzJCf3Bco8FqwKcfw8hhpF1Uaypa+quxkpYz9P
++tP+3e9lGxl0XSEzOwHjfgGWXISUOM1ufVxo2hSLG87yO7naFAtylL8l0Zny8Fb6k
++mT9f3vMktbHdXHUTDNrCUkoElEwwDK3qaur8IPUaIKeSTC3C8E/DVnasLs9cpOs2
++LPIKr3ishbqbHNeWOgGyHbA4KCtvQzBhun9drmtQJW6OyCC9FcIoqPSFM/bs2KHf
++7qATNu9kSMg/YWw7WLAD4GPqH9us1GigQ0h6Y4KG5EgmkFvuQFPLHvT4rtqv51zz
++s1iwFh4+GIagFp+HJ2jnlp+GcZcySlwfnemJAT4EEwECACgCGwMGCwkIBwMCBhUI
++AgkKCwQWAgMBAh4BAheABQkPZe4NBQJeF4rmAAoJEPOHY87f0iVZMPEIAK2Q4ae9
++Sz+b+4TsgehIzrCP/o5dej5MQzWuCeXjSjJJWgyDKifHs9LCL2tKgMLwB9GE3aps
++UsRBysYjxXs/EumOzPlnSb9mdkkA/tMHlaEtEl27fDZyyyN6SEhFz4jYHTSBxGUf
++/+iRfK8a17eSvUl2BqjCduyXBxlHHI129aKBAf9WfP3WUoC6MZQsnKXuG/oqXTYd
++jKdibEaYRLel3lUQ6kD8NHufnhPYn5W5uH31FP5Efa/jp7suc+FmE3a7G8iIkoTw
++unruXVp4xd+Bm/p1DsOX6m7mVRTLIxD6dQwEYpkFZ+3KqF6Rmu9hxWdMlhT3eRTj
++VBQtpFUjCDzzyRSJAT4EEwECACgFAlnuSe4CGwMFCQQcDQAGCwkIBwMCBhUIAgkK
++CwQWAgMBAh4BAheAAAoJEPOHY87f0iVZVMQIAK5wPezq0ROsxiCYPLcR9dF/Qdp2
++1pLfodi6wsC9FAlTVJ3fk2vkNQDb5rMkNvZ/MHf2EWoVIFHvPZcJ6paBjZlapvGF
++qDNrU6hDbakO0PIej5yy+qVeIYcSQpNZeHchAhOOJcnN0o8H6SzZik38b4Hb8H5X
++do78LsZJwU0jsKG6LH3gjiWJtrC+WCXCMYzEGjAJXev2npU2DMVVwxsfYLfdZWq7
++FJJINv8R9EUjtSQQIynJAwb2lFvZB+jC6u8Vv9N1Wid6wh5lF5ejMt6KXqWOvNn+
++YreopmQfbn2XJZxpyn9d7Ev91epYW11E5qG4xNI3m3AmtEGjMTGjfMUstNKJAUEE
++EwECACsCGwMFCQQcDQAGCwkIBwMCBhUIAgkKCwQWAgMBAh4BAheABQJZ7koJAhkB
++AAoJEPOHY87f0iVZszkIALoY0VeQkS4F67VNXZ7c3jsjBkOxBfKmfwMYFWHlWaEU
++ZUc87l2AEEZcQcFymIWTpEZc6rItBqttl3SqYZpMK5qRRTkyKkIH988Sk6bXkJI/
++MkgAAfPQeIOAlzxhb4l8ZQDo/gQdr6s7Jhx8K7ro01hOMFAn/AdzBy4hjXE3MQyF
++vhMIRwz817H3Nnt3T5ZNawrhTybe6LcgMRJGywLNNONzmAf+0zPwq4TBje/3WYdz
++T+81hVBnH1q1Y666Pckkqp2vyiWX+qj/feAhp1jrp2ACtCGrJt08UIQpySGge+U/
++GiqDtc8pLDqjIHEz/TB/+AzkwaxQiYOq7V2PBWUofvG0V1NtYXJ0bW9udG9vbHMg
++U2lnbmluZyBLZXkgKHRocm91Z2ggMjAxOCkgPHNtYXJ0bW9udG9vbHMtZGF0YWJh
++c2VAbGlzdHMuc291cmNlZm9yZ2UubmV0PokBHAQTAQIABgUCWA5kYwAKCRDfDxpJ
++xKSQOp+/CADTlsgisoXI6b+0oohRaD4ZVl5eBtkvTrxNQf6EF7Z1uPkVOqi1OLWF
++GyAmbeLcRmN6c4/DVcaa6GAG7GA+KQwVPRCyC+9Ibsn/+uG6ZFXAez+0eG9NxOfk
++CnYH8ZP8o2VH+9uKJlGGujh9o5r1SNGVifoLGTc8NkWCW+MAKj8dw8WW+wDc80Yr
++dCRrSyLrRU9NLTSE4pIJWKcHLwG63xkXHQPPR1lsJgzdAalfEv1TQdIF3sM+GXp4
++lZ6buahFDiILBh1vj+5C9TdpWZAlqHDYFICa7Rv/MvQa4O9UUl3SlN3sed8zwAmL
++3HeoXE5tBu8iatMaS9e3BmSsVYlhd/q+iQEcBBMBAgAGBQJYDmSWAAoJEC/N7AvT
++rxqr8HsH+QGQuhHYt9Syccd8AF36psyT03mqgbGLMZL8H9ngoa9ZqVMq7O8Aqz23
++SGTtuNuw6EyrcHo7Dy1311GftshI6arsFNJxE2ZNGIfGocRxu9m3Ez+AysWT9sxz
++/haHE+d58NTg+/7R8YWS1q+Tk6m8dA0Xyf3tMBsIJfj0zJvuGMbCLmd93Yw4nk76
++qtSn9UHbnf76UJN5SctAd8+gK3uO6O4XDcZqC06xkWKl193lzcC8sZJBdI15NszC
++3y/epnILDDMBUNQMBm/XlCYQUetyrJnAVzFGXurtjEXQ/DDnbfy2Z8efoG8rtq7v
++3fxS1TC5jSVOIEqOE4TwzRz1Y/dfqSWJAT4EEwECACgCGwMGCwkIBwMCBhUIAgkK
++CwQWAgMBAh4BAheABQJeF4mTBQkPZe4NAAoJEPOHY87f0iVZ5eUH/j1UaC5hKQyK
++kPufAzCMM/fPsmowidb0LxDiozHIHnjzp+O+XleT4ZL7KSrVuk3nVoTfZfzXA2cx
++DwqZIa89uFiQyxVfqNegeDGcEpBk5eP96ooxESrHfDPjErYi69/nlAhYuHQKdLoT
++8rRE71JrY9wcgNEdpbqDivpBLrauotsfQT6/EHOeS6ncLUivKT1NOVkmgrtZtqE4
++SYZBC1ZJTkNnI/g/DK0HSRnd6ZRG/Y+aFG4Y+y1v8tIuDJapNa0AkCp2N70xUAaY
++9aO0+pC4hqkAji019AekUPL7fjxM1zx4tJSHcDq0JOZe4brZ48F5lmlhKUY5bLkO
++TwaxQ7A/TfiJAT4EEwECACgFAlgOYoECGwMFCQQcDQAGCwkIBwMCBhUIAgkKCwQW
++AgMBAh4BAheAAAoJEPOHY87f0iVZXTEH/jMRNzzO9JpyK/w3K7m7fAANyXjJE4TV
++dsRXvUXZJeLSdaIFPE+TwoDKieBnovZlJm4kLtQii0n/ZP6MQUXC2SvBWr/gTI9P
++uGBEX2ceyUM6Lt39EV/Lt6XP/qUVyxOpR/y7pOOdzc6jN7QhcloMPPXRMxZcGKVs
++ewH8YhcLx0oRDzSmXRKfmgQLvKFvZUiosCzRbHpm0hlYfuft8jIiitNqDnQvzTyk
++58cQ4L85eFJZt3TYyN7rgbRTRb7OqipPAl1fQHzNvfd0MWgrUTKYf8pql+M13HnL
++yWKZ977pRWwMw084Hu01YZJmrqcwzS3hPCEubIFI0jjNcd/tkpAYlUk=
++=a+Ts
++-----END PGP PUBLIC KEY BLOCK-----
++"
++
++# gpg_verify FILE.asc FILE
++gpg_verify()
++{
++  local gnupgtmp opts out rc
++  opts="--quiet ${q:+--no-secmem-warnin} --batch --no-tty"
++
++  # Create temp home dir
++  gnupgtmp="$tmpdir/.gnupg.$$.tmp"
++  rm -f -r "$gnupgtmp"
++  mkdir "$gnupgtmp" || exit 1
++  chmod 0700 "$gnupgtmp"
++
++  # Import public key
++  "$GPG" $opts --homedir="$gnupgtmp" --import <<EOF
++$public_key
++EOF
++  test $? = 0 || exit 1
++
++  # Verify
++  rc=0
++  out=`"$GPG" $opts --homedir="$gnupgtmp" --verify "$1" "$2" </dev/null 2>&1` || rc=1
++  if [ $rc = 0 ]; then
++    vecho "$out"
++  else
++    # print gpg error always
++    echo "$out" >&2
++  fi
++
++  rm -f -r "$gnupgtmp"
++  return $rc
++}
++
++# mv_all PREFIX OLD NEW
++mv_all()
++{
++  mv "${1}${2}"         "${1}${3}"
++  mv "${1}${2}.raw"     "${1}${3}.raw"
++  mv "${1}${2}.raw.asc" "${1}${3}.raw.asc"
++}
++
+ # Parse options
+ smtctl=$SMARTCTL
+ tool=
+ url=
+ q="-q"
+ dryrun=
++trunk=
+ cacert=
+ capath=
+ insecure=
++no_verify=
+ 
+ while true; do case $1 in
+   -s)
+@@ -237,6 +445,9 @@ while true; do case $1 in
+   --dryrun)
+     dryrun=t ;;
+ 
++  --trunk)
++    trunk=trunk ;;
++
+   --cacert)
+     shift; test -n "$1" || usage
+     cacert=$1 ;;
+@@ -248,6 +459,15 @@ while true; do case $1 in
+   --insecure)
+     insecure=t ;;
+ 
++  --no-verify)
++    no_verify=t ;;
++
++  --export-key)
++    cat <<EOF
++$public_key
++EOF
++    exit 0 ;;
++
+   -*)
+     usage ;;
+ 
+@@ -269,7 +489,7 @@ if [ -z "$tool" ]; then
+       break
+     fi
+   done
+-  test -n "$tool" || error "found none of: $os_dltools"
++  test -n "$tool" || error "found none of '$os_dltools' in $pathinfo"
+ fi
+ 
+ test -n "$url" || selecturl "svn"
+@@ -291,95 +511,105 @@ case "$tool:$insecure" in
+   lynx:t) warning "'--insecure' is ignored if '-t lynx' is used" ;;
+ esac
+ 
+-# Try possible branch first, then trunk
+-errmsg=
+-errmsg2=
+-for location in "branches/$BRANCH" "trunk"; do
+-  test -z "$errmsg" || errmsg2=$errmsg
+-  vecho "Download from $location with $tool"
+-
+-  # Adjust URL
+-  case $location in
+-    trunk) src=$url ;;
+-    *)     src=`echo "$url" | sed "s,/trunk/,/$location/,"` ;;
+-  esac
+-
+-  # Download
+-  test -n "$dryrun" || rm -f "$DEST.new" || exit 1
+-  rc=0
+-  download "$src" "$DEST.new" || rc=$?
+-  test -z "$dryrun" || continue
++# Check for smartctl
++if [ "$smtctl" != "-" ]; then
++  "$smtctl" -V >/dev/null 2>&1 \
++  || err_notfound "$smtctl" "('-s -' to ignore)"
++fi
+ 
+-  errmsg=
+-  if [ $rc != 0 ]; then
+-    errmsg="download from $location failed ($tool: exit $rc)"
+-    continue
+-  fi
++# Check for GnuPG
++if [ -z "$no_verify" ]; then
++  test -n "$GPG" \
++  || error "GnuPG is not available ('--no-verify' to ignore)"
++  "$GPG" --version >/dev/null 2>&1 \
++  || err_notfound "$GPG" "('--no-verify' to ignore)"
++fi
+ 
+-  # Check file contents
+-  case `sed 1q "$DEST.new"` in
+-    /*) ;;
+-    \<*)
+-      errmsg="download from $location failed (HTML error message)"
+-      continue ;;
+-    *)
+-      errmsg="download from $location failed (Unknown file contents)"
+-      continue ;;
+-  esac
++# Use destination directory as temp directory for gpg
++tmpdir=`dirname "$DEST"`
+ 
+-  # Check file size
+-  size=`wc -c < "$DEST.new"`
+-  if [ "$size" -lt 10000 ]; then
+-    errmsg="download from $location failed (too small file size $size bytes)"
+-    continue
+-  fi
+-  if [ "$size" -gt 1000000 ]; then
+-    errmsg="download from $location failed (too large file size $size bytes)"
+-    break
+-  fi
++# Adjust URLs
++src=`echo "$url" | sed -e "s,/trunk/,/branches/$BRANCH/," \
++                       -e "s,/master/,/origin/$BRANCH/,"`
++src_asc=`echo "$src" | sed "s,/drivedb\.h,/drivedb.h.raw.asc,"`
++test -z "$trunk" || src=$url
+ 
+-  break
+-done
++# Download
++test -n "$dryrun" || rm -f "$DEST.new" "$DEST.new.raw" "$DEST.new.raw.asc"
+ 
+-test -z "$dryrun" || exit 0
++vecho "Download ${trunk:-branches/$BRANCH}/drivedb.h with $tool"
++rc=0
++download "$src" "$DEST.new" || rc=$?
++if [ $rc != 0 ]; then
++  rm -f "$DEST.new"
++  error "${trunk:-$BRANCH}/drivedb.h: download failed ($tool: exit $rc)"
++fi
++if ! errmsg=`check_file "$DEST.new" '/' 10000 1000000`; then
++  mv "$DEST.new" "$DEST.error"
++  error "$DEST.error: $errmsg"
++fi
+ 
+-if [ -n "$errmsg" ]; then
++vecho "Download branches/$BRANCH/drivedb.h.raw.asc with $tool"
++rc=0
++download "$src_asc" "$DEST.new.raw.asc" || rc=$?
++if [ $rc != 0 ]; then
++  rm -f "$DEST.new" "$DEST.new.raw.asc"
++  error "$BRANCH/drivedb.h.raw.asc: download failed ($tool: exit $rc)"
++fi
++if ! errmsg=`check_file "$DEST.new.raw.asc" '-' 200 2000`; then
+   rm -f "$DEST.new"
+-  test -z "$errmsg2" || echo "$myname: $errmsg2" >&2
+-  error "$errmsg"
++  mv "$DEST.new.raw.asc" "$DEST.error.raw.asc"
++  error "$DEST.error.raw.asc: $errmsg"
+ fi
+ 
+-# Adjust timestamp and permissions
+-touch "$DEST.new"
+-chmod 0644 "$DEST.new"
++test -z "$dryrun" || exit 0
++
++# Create raw file with unexpanded SVN Id
++# (This assumes newlines are LF and not CR/LF)
++unexpand_svn_id < "$DEST.new" > "$DEST.new.raw"
++
++# Adjust timestamps and permissions
++touch "$DEST.new" "$DEST.new.raw" "$DEST.new.raw.asc"
++chmod 0644 "$DEST.new" "$DEST.new.raw" "$DEST.new.raw.asc"
++
++if [ -z "$no_verify" ]; then
++  # Verify raw file
++  if ! gpg_verify "$DEST.new.raw.asc" "$DEST.new.raw"; then
++    mv_all "$DEST" ".new" ".error"
++    test -n "$trunk" || error "$DEST.error.raw: *** BAD signature or outdated key ***"
++    error "$DEST.error.raw: signature from branch no longer valid ('--no-verify' to ignore)"
++  fi
++fi
+ 
+ if [ "$smtctl" != "-" ]; then
+   # Check syntax
+-  rm -f "$DEST.error"
+-  if "$smtctl" -B "$DEST.new" -P showall >/dev/null; then
+-    test -n "$q" || echo "$smtctl: syntax OK"
+-  else
+-    mv "$DEST.new" "$DEST.error"
+-    echo "$DEST.error: rejected by $smtctl, probably no longer compatible" >&2
+-    exit 1
++  if ! "$smtctl" -B "$DEST.new" -P showall >/dev/null; then
++    mv_all "$DEST" ".new" ".error"
++    error "$DEST.error: rejected by $smtctl, probably no longer compatible"
+   fi
++  vecho "$smtctl: syntax OK"
+ fi
+ 
+ # Keep old file if identical, ignore missing Id keyword expansion in new file
+ rm -f "$DEST.lastcheck"
+ if [ -f "$DEST" ]; then
+-  if    cmp "$DEST" "$DEST.new" >/dev/null 2>/dev/null \
+-     || cat "$DEST" | sed 's|\$''Id''[^$]*\$|$''Id''$|' \
+-        | cmp - "$DEST.new" >/dev/null 2>/dev/null; then
+-    rm -f "$DEST.new"
+-    touch "$DEST.lastcheck"
+-    echo "$DEST is already up to date"
+-    exit 0
++  if [ -f "$DEST.raw" ] && [ -f "$DEST.raw.asc" ]; then
++    if    cmp "$DEST.raw"     "$DEST.new.raw"     >/dev/null 2>&1 \
++       && cmp "$DEST.raw.asc" "$DEST.new.raw.asc" >/dev/null 2>&1 \
++       && {   cmp "$DEST"     "$DEST.new" >/dev/null 2>&1 \
++           || cmp "$DEST.raw" "$DEST.new" >/dev/null 2>&1; }
++    then
++      rm -f "$DEST.new" "$DEST.new.raw" "$DEST.new.raw.asc"
++      touch "$DEST.lastcheck"
++      echo "$DEST is already up to date"
++      exit 0
++    fi
++    mv_all "$DEST" "" ".old"
++  else
++    mv "$DEST" "$DEST.old"
+   fi
+-  mv "$DEST" "$DEST.old"
+ fi
+ 
+-mv "$DEST.new" "$DEST"
+-
+-echo "$DEST updated from $location"
++mv_all "$DEST" ".new" ""
+ 
++echo "$DEST updated from ${trunk:-branches/$BRANCH}${no_verify:+ (NOT VERIFIED)}"

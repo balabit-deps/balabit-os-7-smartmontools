@@ -1,7 +1,8 @@
 Source: smartmontools
 Section: utils
 Priority: optional
-Maintainer: Giuseppe Iuculano <iuculano@debian.org>
+Maintainer: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+XSBC-Original-Maintainer: Giuseppe Iuculano <iuculano@debian.org>
 Uploaders: Florian Maier <contact@marsmenschen.com>,
            Jonathan Dowland <jmtd@debian.org>
 Build-Depends: autoconf,
@@ -27,6 +28,8 @@ Depends: debianutils (>= 2.2),
          ${shlibs:Depends}
 Recommends: mailx | mailutils
 Suggests: gsmartcontrol, smart-notifier
+# update-smart-drivedb
+    ,curl | wget | lynx, gpg
 Description: control and monitor storage systems using S.M.A.R.T.
  The smartmontools package contains two utility programs (smartctl and smartd)
  to control and monitor storage systems using the Self-Monitoring, Analysis and
